@@ -22,7 +22,7 @@
 - 插件里还出现过测试环境 `pretestcapital.hexin.cn`、`//172.21.52.127`，**不要用**，那是内网/测试地址。
 - 前端拼接逻辑（插件 JS 反混淆后）：`buildForwardUrl(t) => this.server + "/caishen_httpserver/tzzb" + t`，`this.server = "//tzzb.10jqka.com.cn"`。
 
-### 1.2 绕过 403 的四个必要条件
+### 1.2 绕过 403 的必要条件
 
 直接用 Cookie 发 GET 会被 CDN 层（openresty/squid）拦掉，返回 `HTTP 403` + 文本 `请求失败，请稍后重试`。请求根本到不了后端。绕过它必须**同时满足**：
 
@@ -30,12 +30,65 @@
 2. **body 是表单编码** `application/x-www-form-urlencoded`，不是 JSON。
 3. **带 `origin` 和 `referer` 头**（值见上表）。这是 WAF 校验的核心，缺一个就 403。
 4. **带完整 Cookie 头**。
+5. **带 `hexin-v` 头，且每个请求都要换一个新值**。这是 2026-10-22 才定位到的
+   **最关键的第五条**，详见 §1.5。
 
 > 排查经验：如果收到 403 + `请求失败，请稍后重试`，先确认上面 4 点，而不是怀疑 Cookie 过期。
 > 真正的 Cookie 过期通常表现为 HTTP 200 但 `error_code != 0`，或 401。
 >
 > CLI 现在把 401/403 都当作"可能过期"处理：会自动从浏览器重新读取 Cookie 并重试一次，
 > 只有拿到与当前不同的新 Cookie 才重试（所以 WAF 拦出来的 403 不会被误判）。
+
+### 1.5 hexin-v 反爬 token（403 的真正主因）
+
+页面上的 `chameleon.min.<ver>.js` 会生成反爬 token（Cookie 里的 `v` / `hexin-v` 头）。
+**2026-10-28 抓包修正**：官方 PC 页面实际是**每个请求换一枚新 token 并写回 Cookie 的 `v`**，
+**不发 `hexin-v` 请求头**（11 个请求里 10 个带不同 `v`、0 个带 `hexin-v`、0 个 `Set-Cookie`，
+`v` 由 chameleon 在页面里执行 `document.cookie=...` 写入）。
+
+服务端两种都认，关键是"每次请求都用一枚新 token"：
+
+| 发法 | 结果 |
+| --- | --- |
+| 旧 Cookie `v` + 不带 `hexin-v` 头 | 403 |
+| 新 Cookie `v`（每请求轮换）+ 不带 `hexin-v` 头 | 200（官方页面行为） |
+| 旧 Cookie `v` + 新 `hexin-v` 头 | 200 |
+| 同一个 token 反复用 | 前 8~10 个 200，之后全部 `<h1>Nginx forbidden.</h1>` |
+| **每请求换一枚新 token** | **零延迟连发几十个全部 200** |
+
+所以 403 的成因既不是 IP 封禁，也不是频率限流，而是 **token 复用超限**。浏览器里看起来
+"永不封"，只是因为 chameleon 每发一个请求就重新生成一次 token。
+
+token 形态与刷新方法（2026-10-28 用官方脚本生成 200 枚 token 统计得出）：
+
+- 60 字符 URL-safe base64，解码后 45 字节；
+- `raw[0] = 3`（版本），`raw[1]` 是校验和，`raw[2:]` 是 43 字节 payload，逐字节异或混淆；
+- payload 里只有少数几个字段会变，其余是**会话/设备模板**（换会话会变，不能随机构造）：
+
+  | 区间 | 内容 |
+  | --- | --- |
+  | `[0:8]` | 会话/设备 ID |
+  | `[8:12]` | Unix 秒（大端） |
+  | `[12:20]` | 指纹相关字段 |
+  | `[20:40]` | 基本固定（多为 0 与少量常量） |
+  | `[40:42]` | 计数器（大端 uint16，每枚 token +1） |
+  | `[42]` | `=3` |
+
+- 因此正确做法是**数学刷新**：解码 → 时间戳改成当前秒、计数器 +1 → 重算校验位 → 重编码。
+  实测：从 6 天前的旧 `v` 刷新后连续请求全部 200；随机改模板则约 20% 概率 403。
+
+本仓库的做法（`internal/hexinv`）：
+
+1. **主路径（数学刷新，不跑 JS）**：解码 Cookie 里的 `v`，改时间/计数后重新编码，
+   写回**内存** Cookie（不写盘），同时设置 `hexin-v` 头；
+2. **兜底**：Cookie 里没有可识别的 v3 token 时，用纯 Go 的 JS 引擎
+   [goja](https://github.com/dop251/goja) + 最小 DOM 垫片跑官方 chameleon 脚本现算一枚
+   （`go:embed` 内置脚本；不需要 Chromium、不需要 Node）；
+3. **403 有界重试**：被拒时换一枚新 token 重试（最多 2 次，300ms/900ms），
+   连续失败才按登录态失效上报。
+
+脚本可以自动跟进版本：版本号约为 `Unix秒/1000`（每 ~17 分钟滚动），旧版本 CDN 仍可访问，
+见 `hexinv.ScriptURLTemplate`。
 
 ### 1.3 Cookie 与 uid
 
@@ -55,7 +108,42 @@ userid=<uid>
 user_id=<uid>
 ```
 
+另外每个请求都会换一枚**新反爬 token**（同时写进 Cookie 的 `v` 和 `hexin-v` 头，
+见 §1.5），由 `internal/hexinv` 负责，业务代码无需关心。
+
 ---
+
+### 1.6 扫码登录（同花顺 APP 扫码，纯 HTTP）
+
+比短信更稳的通道：不走图形验证码、不走滑块、不发短信，用户用同花顺投资账本 APP
+（或同花顺 APP）扫码确认即可。实测 2026-10-22 可用。
+
+| 步骤 | 请求 | 说明 |
+| --- | --- | --- |
+| 1 | `GET /scan/creatCode` | 返回 `{"qrid":"usk_..."}` |
+| 2 | `GET /scan/creatImg?qrid=<qrid>&source=tzzb_web` | 返回 252×252 PNG 二维码（41×41 模块，每模块 6px） |
+| 3 | `POST /scan/getInfoNew` | 表单 `qrid`、`state=1`、`source=pc_web`、`page_source=web_screen`、`request_type=login` |
+
+轮询返回 `status`：
+
+| status | 含义 |
+| --- | --- |
+| `0` | 二维码失效，需重新 `creatCode` / `creatImg` |
+| `1` | 等待扫码 |
+| `2` | 已扫码，等待手机上确认 |
+| `3` | 确认成功，会话已登录（响应同时下发登录态 Cookie） |
+
+要点：
+
+- `creatImg` 的 `source` 用页面场景代号（tzzb 是 `tzzb_web`），与二维码里编码的
+  `qrlogin?source=...` 一致；
+- 轮询响应里的 `expired=1` 在**正常等待时**也会出现，判断失效只能看 `status=0`；
+- 二维码是 41×41 模块：终端里用"1 模块 = 1 字符宽 × 2 模块高"的半方块渲染，
+  实测可被手机识别；终端放不下时不要缩放（会丢模块），应改用图片窗口；
+- 二维码内容由 `source` 决定：`tzzb_web`（默认）→ `https://tzzb.10jqka.com.cn/qrlogin?source=tzzb_web&qrid=...`；
+  `pc_web`/`web_screen`/空 → `http://mobile.10jqka.com.cn/?source=PC&qrid=...`。两种 qrid 状态机相同，
+  都需用同花顺投资账本 APP 的「扫一扫」解析（用系统相机/浏览器打开会跳首页）；
+- `TZZB_QR_SOURCE` 可覆盖 `source`（排查 APP 扫码兼容性用）。
 
 ## 2. 统一响应结构
 
@@ -783,6 +871,28 @@ manualid, fundkey, rzrq_fundkey, stock_code, stock_account, from_pc=1
 
 **验证**：实测 `merge` 的 `market_value` = `count × price_curr`（5000×0.941=4705），`trans_amount` 与 `trans_count×trans_price` 一致；未清仓股 `clear_position_query` 返回全 0，`total_position_query` 给出建仓日。
 
+### 3.13 init / status — 触发服务端重新计算（已接入，零浏览器）
+
+对应命令 `tzzb refresh`。服务端汇总值（持仓/现金/总资产）**不是实时计算的**：手机投资账本 APP 上传新数据后，服务端需要执行一次 `init` 才会重算，否则 `account_list`/`stock_card` 里的汇总值可能长时间是旧的（例如清仓后仍显示旧持仓、当日成交后现金不变）。
+
+PC 网页加载时的真实流程（见 `pc/index.*.js` 的 `triggerStockServerCal` / `pollStockServerCal`）：
+
+```
+account_list（取账户 ID）→ init（触发重算，响应 {}）→ 每 500ms 轮询 status
+→ 全部 status=0 → 再读取持仓/资产接口
+```
+
+| path | 语义 | 参数 | 响应要点 |
+|---|---|---|---|
+| `pc/account/v1/init` | 触发服务端重算 | `manual_id` / `fund_key` / `rzrq_fund_key` | 纯动作，返回 `{}` |
+| `pc/account/v1/status` | 查询计算状态 | 同上 | `{"data":[{"manual_id"|"fund_key", "status"}]}` |
+
+- 账户坐标与 `account_list` 对应：手工账户传 `manual_id`（它的 `fund_key` 就是自身数字 id，**不要**混入 `fund_key` 列表）、普通账户传 `fund_key`、两融传 `rzrq_fund_key`；基金账户是另一套 `init_fund`/`status_fund`。
+- `status`：`-1` 失败 / `0` 完成 / `1` 计算中。全部非 `1` 即结束（计算通常几百毫秒，多数情况第一次轮询就是 `0`）。
+- **注意设计约束**：同花顺要求「手机端触发一次同步/上传」，这一步 CLI/网页都无法代替；`init` 只负责让服务端把**已上传**的数据算进汇总值。所以完整流程是：手机 APP 同步一次 → `tzzb refresh` → 再查询。
+
+**验证**：2026-10-22 手机同步后 49 秒读到的汇总值仍是旧的，直连 `init` 后 5 秒内刷新（现金变化量 = 逆回购利息级别）；同期页面加载也仅做同样动作。
+
 ### 3.9 全量原始清单（附录，共 227 条，一条不落）
 
 §3.8 是分类精选，此处为从插件 JS 扒到的全部 `/caishen_fund/...` 端点原样罗列（去掉 `caishen_fund/` 前缀，按一级模块字母序分组），保证完整无遗漏。调用前均需拼公共前缀 `/caishen_httpserver/tzzb`（见 §1.1）。
@@ -1395,6 +1505,7 @@ tzzb login --cookie "userid=...; ..."# 手工：直接参数传
 pbpaste | tzzb login                 # 手工：从剪贴板管道输入
 
 # 查看
+tzzb refresh                         # 触发服务端重算（等价于打开一次 PC 网页，零浏览器）
 tzzb account list                    # 账户列表 + 汇总
 tzzb position list                   # 全部持仓
 tzzb position list -a 华宝           # 按账户名模糊过滤
